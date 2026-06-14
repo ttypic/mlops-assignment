@@ -55,9 +55,20 @@ def health() -> dict[str, str]:
 @app.post("/answer", response_model=AnswerResponse)
 def answer(req: AnswerRequest) -> AnswerResponse:
     state = AgentState(question=req.question, db_id=req.db)
+
+    # Langfuse trace attributes. `langfuse_tags` becomes the visible chips in
+    # the trace list (what we filter on in Phase 6); the raw tags + db_id stay
+    # in metadata for finer-grained filtering. We always tag the db so traces
+    # can be sliced per database. `run_name` names the trace.
+    lf_tags = [f"db:{req.db}"] + [f"{k}:{v}" for k, v in req.tags.items()]
     config: dict[str, Any] = {
         "callbacks": [_lf_handler] if _lf_handler is not None else [],
-        "metadata": req.tags,
+        "run_name": f"agent:{req.db}",
+        "metadata": {
+            **req.tags,
+            "db_id": req.db,
+            "langfuse_tags": lf_tags,
+        },
     }
     try:
         final = graph.invoke(state, config=config)
