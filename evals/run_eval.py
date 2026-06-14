@@ -56,9 +56,76 @@ def matches(gold_rows: list[tuple] | None, pred_rows: list[tuple] | None) -> boo
 
 # ---------- Implement these (Phase 5) ----------------------------------
 
+def _iteration_sqls(history: list[dict]) -> list[str]:
+    """Pull the SQL produced at each iteration, in order.
+
+    generate_sql (iter 0) and each revise (iter 1, 2, ...) append an entry with
+    a "sql" field to the agent's history. The verify entries don't, so filtering
+    on the presence of "sql" recovers exactly the per-iteration attempts.
+    """
+    return [h["sql"] for h in history if h.get("node") in ("generate_sql", "revise") and "sql" in h]
+
+
 def eval_one(question: dict, agent_url: str) -> dict:
-    """Score one question. Return a dict capturing per-iteration correctness."""
-    raise NotImplementedError("Phase 5")
+    """Score one question. Return a dict capturing per-iteration correctness.
+
+    Execution accuracy: run BOTH the agent's SQL and the gold SQL against the
+    target DB and compare canonicalized row sets. We score the SQL at *every*
+    iteration the agent emitted (from history), so summarize() can report the
+    pass rate as if we'd stopped after iter 0, iter 1, etc.
+    """
+    db_id = question["db_id"]
+    gold_sql = question["gold_sql"]
+
+    # Gold rows are the reference; compute once. A broken gold query just means
+    # nothing can match it (matches() returns False on None), which we surface.
+    gold_ok, gold_rows, gold_err = run_sql(db_id, gold_sql)
+
+    record: dict = {
+        "db_id": db_id,
+        "question": question["question"],
+        "gold_sql": gold_sql,
+        "gold_ok": gold_ok,
+        "gold_error": gold_err,
+        "pred_sql": "",
+        "n_iterations": 0,
+        "per_iter": [],
+        "final_correct": False,
+        "agent_ok": False,
+        "error": None,
+    }
+
+    # Call the agent over HTTP. A request failure is a non-fatal eval outcome:
+    # record it and move on (counts as incorrect, 0 iterations).
+    try:
+        resp = httpx.post(
+            agent_url,
+            json={"question": question["question"], "db": db_id,
+                  "tags": {"phase": "phase5", "run": "baseline"}},
+            timeout=180.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:  # noqa: BLE001
+        record["error"] = f"{type(e).__name__}: {e}"
+        return record
+
+    record["agent_ok"] = bool(data.get("ok"))
+    record["pred_sql"] = data.get("sql", "")
+    if data.get("error"):
+        record["error"] = data["error"]
+
+    sqls = _iteration_sqls(data.get("history", []))
+    record["n_iterations"] = len(sqls)
+
+    # Score each iteration's SQL by executed rows against gold.
+    per_iter: list[bool] = []
+    for sql in sqls:
+        _ok, pred_rows, _err = run_sql(db_id, sql)
+        per_iter.append(matches(gold_rows, pred_rows))
+    record["per_iter"] = per_iter
+    record["final_correct"] = per_iter[-1] if per_iter else False
+    return record
 
 
 def summarize(results: list[dict]) -> dict:
@@ -70,7 +137,41 @@ def summarize(results: list[dict]) -> dict:
     The agent stopped emitting; whatever it had at termination is what
     would have been served had we polled at iteration k.
     """
-    raise NotImplementedError("Phase 5")
+    n = len(results)
+    if n == 0:
+        return {"n_questions": 0, "overall_pass_rate": 0.0, "mean_iterations": 0.0,
+                "pass_at_iter": {}, "n_request_errors": 0}
+
+    # Number of iteration slots to report: the deepest any question went
+    # (at least 1 so we always emit iter 0).
+    max_iters = max((len(r["per_iter"]) for r in results), default=0)
+    max_iters = max(max_iters, 1)
+
+    def result_at(per_iter: list[bool], k: int) -> bool:
+        # Carry forward the last emitted attempt; failed runs (empty) are False.
+        if not per_iter:
+            return False
+        return per_iter[k] if k < len(per_iter) else per_iter[-1]
+
+    pass_at_iter = {
+        str(k): round(sum(result_at(r["per_iter"], k) for r in results) / n, 4)
+        for k in range(max_iters)
+    }
+
+    overall = sum(r["final_correct"] for r in results) / n
+    mean_iters = sum(r["n_iterations"] for r in results) / n
+    n_errors = sum(1 for r in results if r.get("error") and not r["per_iter"])
+    # How many questions the loop actually revised (>1 attempt).
+    n_revised = sum(1 for r in results if r["n_iterations"] > 1)
+
+    return {
+        "n_questions": n,
+        "overall_pass_rate": round(overall, 4),
+        "mean_iterations": round(mean_iters, 4),
+        "pass_at_iter": pass_at_iter,
+        "n_revised": n_revised,
+        "n_request_errors": n_errors,
+    }
 
 
 # ---------- Main (provided) --------------------------------------------
