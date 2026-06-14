@@ -52,6 +52,10 @@ class AgentState:
     execution: ExecutionResult | None = None
     verify_ok: bool = False
     verify_issue: str = ""
+    # Set when an LLM/infra call fails (e.g. vLLM 400 context-length, 5xx,
+    # timeout, connection error). Terminates the loop and is surfaced by the
+    # server as a clean ok=false result instead of crashing the request.
+    error: str = ""
     iteration: int = 0
     history: list[dict[str, Any]] = field(default_factory=list)
 
@@ -111,6 +115,22 @@ def _parse_verify_json(text: str) -> dict:
     return {"ok": True, "issue": ""}
 
 
+async def _safe_ainvoke(messages: list) -> tuple[str | None, str | None]:
+    """Call the LLM, returning (content, None) on success or (None, error) on
+    ANY failure (vLLM 400 context-length, 5xx, timeout, connection error, ...).
+
+    This is the resilience boundary: a single bad call degrades that node to a
+    graceful failure (surfaced as ok=false) instead of bubbling up and 500-ing
+    the whole request. We deliberately catch broadly - the root cause varies
+    and the agent's job is to not crash regardless.
+    """
+    try:
+        response = await llm().ainvoke(messages)
+        return response.content, None
+    except Exception as e:  # noqa: BLE001
+        return None, f"{type(e).__name__}: {e}"
+
+
 async def generate_sql_node(state: AgentState) -> dict:
     """Worked example - the other LLM nodes follow this same shape.
 
@@ -122,14 +142,23 @@ async def generate_sql_node(state: AgentState) -> dict:
     once (Phase 6, H1): a single process issues concurrent vLLM calls that the
     engine batches, instead of one blocking thread per request.
     """
-    response = await llm().ainvoke([
+    content, err = await _safe_ainvoke([
         ("system", prompts.GENERATE_SQL_SYSTEM),
         ("user", prompts.GENERATE_SQL_USER.format(
             schema=state.schema,
             question=state.question,
         )),
     ])
-    sql = _extract_sql(response.content)
+    if err is not None:
+        # No SQL to run. Terminate the loop (route_after_verify checks `error`)
+        # and let the server report it as a clean failure.
+        return {
+            "sql": "",
+            "error": err,
+            "iteration": state.iteration + 1,
+            "history": state.history + [{"node": "generate_sql", "error": err}],
+        }
+    sql = _extract_sql(content)
     return {
         "sql": sql,
         "iteration": state.iteration + 1,
@@ -155,6 +184,16 @@ async def verify_node(state: AgentState) -> dict:
     What counts as "not plausible" is yours to define - see the Phase 3 targets
     in the README.
     """
+    # An LLM/infra error upstream (generate or revise) means there's nothing
+    # worth re-verifying or revising. End the loop cleanly (verify_ok=True so
+    # the router terminates); the server surfaces state.error.
+    if state.error:
+        return {
+            "verify_ok": True,
+            "verify_issue": state.error,
+            "history": state.history + [{"node": "verify", "skipped": True, "error": state.error}],
+        }
+
     execution = state.execution
     result_text = execution.render() if execution is not None else "ERROR: no result"
 
@@ -164,7 +203,7 @@ async def verify_node(state: AgentState) -> dict:
         issue = execution.error if execution is not None else "no execution result"
         verdict = {"ok": False, "issue": issue or "SQL execution failed"}
     else:
-        response = await llm().ainvoke([
+        content, err = await _safe_ainvoke([
             ("system", prompts.VERIFY_SYSTEM),
             ("user", prompts.VERIFY_USER.format(
                 question=state.question,
@@ -172,7 +211,13 @@ async def verify_node(state: AgentState) -> dict:
                 result=result_text,
             )),
         ])
-        verdict = _parse_verify_json(response.content)
+        if err is not None:
+            # We already have an executed, non-empty result; we just can't judge
+            # it. Accept it (fail-open) rather than failing the request - serving
+            # a plausible answer beats a 500 because the verifier hiccuped.
+            verdict = {"ok": True, "issue": f"verify skipped: {err}"}
+        else:
+            verdict = _parse_verify_json(content)
 
     return {
         "verify_ok": verdict["ok"],
@@ -197,7 +242,7 @@ async def revise_node(state: AgentState) -> dict:
     """
     execution = state.execution
     result_text = execution.render() if execution is not None else "ERROR: no result"
-    response = await llm().ainvoke([
+    content, err = await _safe_ainvoke([
         ("system", prompts.REVISE_SYSTEM),
         ("user", prompts.REVISE_USER.format(
             schema=state.schema,
@@ -207,7 +252,15 @@ async def revise_node(state: AgentState) -> dict:
             issue=state.verify_issue,
         )),
     ])
-    sql = _extract_sql(response.content)
+    if err is not None:
+        # Keep the prior SQL (it may still be the best we have) and end the
+        # loop via state.error; don't blank it or spin further failing calls.
+        return {
+            "error": err,
+            "iteration": state.iteration + 1,
+            "history": state.history + [{"node": "revise", "error": err}],
+        }
+    sql = _extract_sql(content)
     return {
         "sql": sql,
         "iteration": state.iteration + 1,
@@ -223,9 +276,11 @@ def route_after_verify(state: AgentState) -> str:
     """Conditional router: return "revise" to loop, "end" to terminate.
 
     Two reasons to end: the verifier was happy (state.verify_ok), or you've hit
-    the iteration cap (state.iteration >= MAX_ITERATIONS). Otherwise, revise.
+    the iteration cap (state.iteration >= MAX_ITERATIONS). We also end on a
+    captured LLM/infra error - revising won't help if the model call itself
+    failed. Otherwise, revise.
     """
-    if state.verify_ok or state.iteration >= MAX_ITERATIONS:
+    if state.error or state.verify_ok or state.iteration >= MAX_ITERATIONS:
         return "end"
     return "revise"
 
