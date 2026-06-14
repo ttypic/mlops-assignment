@@ -20,6 +20,7 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any
 
 from langchain_openai import ChatOpenAI
@@ -55,8 +56,16 @@ class AgentState:
     history: list[dict[str, Any]] = field(default_factory=list)
 
 
+@lru_cache(maxsize=1)
 def llm() -> ChatOpenAI:
-    """Chat client pointed at VLLM_BASE_URL (your local vLLM by default)."""
+    """Chat client pointed at VLLM_BASE_URL (your local vLLM by default).
+
+    Cached so the whole process shares ONE client (and one underlying httpx
+    connection pool). Rebuilding it per call - 2-3x per request, thousands of
+    requests under load - churns TCP/TLS connections and is a likely source of
+    HTTP errors at high RPS (Phase 6, H2). The client is concurrency-safe and
+    reused across all in-flight async requests.
+    """
     return ChatOpenAI(
         model=VLLM_MODEL,
         base_url=VLLM_BASE_URL,
@@ -102,17 +111,18 @@ def _parse_verify_json(text: str) -> dict:
     return {"ok": True, "issue": ""}
 
 
-def generate_sql_node(state: AgentState) -> dict:
+async def generate_sql_node(state: AgentState) -> dict:
     """Worked example - the other LLM nodes follow this same shape.
 
     Build messages from the prompts, call the shared llm(), extract the SQL,
     and return only the state fields you changed. `iteration` is bumped here
     (and in revise) so route_after_verify can enforce MAX_ITERATIONS.
 
-    This node is wired and ready; fill in GENERATE_SQL_SYSTEM / GENERATE_SQL_USER
-    in prompts.py to make it produce real queries.
+    Async + `ainvoke` so the event loop can have many agent runs in flight at
+    once (Phase 6, H1): a single process issues concurrent vLLM calls that the
+    engine batches, instead of one blocking thread per request.
     """
-    response = llm().invoke([
+    response = await llm().ainvoke([
         ("system", prompts.GENERATE_SQL_SYSTEM),
         ("user", prompts.GENERATE_SQL_USER.format(
             schema=state.schema,
@@ -132,7 +142,7 @@ def execute_node(state: AgentState) -> dict:
     return {"execution": execute_sql(state.db_id, state.sql)}
 
 
-def verify_node(state: AgentState) -> dict:
+async def verify_node(state: AgentState) -> dict:
     """Decide whether state.execution plausibly answers state.question.
 
     Follow the generate_sql_node pattern: build messages from the VERIFY_*
@@ -154,7 +164,7 @@ def verify_node(state: AgentState) -> dict:
         issue = execution.error if execution is not None else "no execution result"
         verdict = {"ok": False, "issue": issue or "SQL execution failed"}
     else:
-        response = llm().invoke([
+        response = await llm().ainvoke([
             ("system", prompts.VERIFY_SYSTEM),
             ("user", prompts.VERIFY_USER.format(
                 question=state.question,
@@ -175,7 +185,7 @@ def verify_node(state: AgentState) -> dict:
     }
 
 
-def revise_node(state: AgentState) -> dict:
+async def revise_node(state: AgentState) -> dict:
     """Produce a revised SQL query given state.verify_issue and the prior attempt.
 
     Same shape as generate_sql_node, but the prompt should include the failing
@@ -187,7 +197,7 @@ def revise_node(state: AgentState) -> dict:
     """
     execution = state.execution
     result_text = execution.render() if execution is not None else "ERROR: no result"
-    response = llm().invoke([
+    response = await llm().ainvoke([
         ("system", prompts.REVISE_SYSTEM),
         ("user", prompts.REVISE_USER.format(
             schema=state.schema,
