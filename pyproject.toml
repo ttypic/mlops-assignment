@@ -6,6 +6,10 @@ requires-python = ">=3.11"
 dependencies = [
     # Serving
     "vllm>=0.9.0,<0.11",
+    # vLLM 0.10.x targets the transformers 4.x tokenizer API; transformers 5.0
+    # dropped Qwen2Tokenizer.all_special_tokens_extended, which vLLM still reads.
+    # Cap below 5 so uv can't resolve a v5 that breaks tokenizer init at startup.
+    "transformers>=4.55.2,<5",
     # Agent (major-version bounded; uv.lock pins exactly)
     "langgraph>=1.0,<2.0",
     "langchain>=1.0,<2.0",
