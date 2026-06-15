@@ -79,10 +79,6 @@ async def answer(req: AnswerRequest) -> AnswerResponse:
     iteration = final.get("iteration", 0)
     history = final.get("history", [])
     execution = final.get("execution")
-    # An LLM/infra error captured by a node (e.g. vLLM context-length / 5xx /
-    # timeout). Prefer it over the downstream sqlite message so the response
-    # reports the real root cause instead of a misleading "syntax error".
-    agent_error = final.get("error") or None
 
     if execution is None:
         return AnswerResponse(
@@ -90,7 +86,7 @@ async def answer(req: AnswerRequest) -> AnswerResponse:
             rows=None,
             iterations=iteration,
             ok=False,
-            error=agent_error or "agent produced no execution result",
+            error="agent produced no execution result",
             history=history,
         )
     if not execution.ok:
@@ -99,7 +95,7 @@ async def answer(req: AnswerRequest) -> AnswerResponse:
             rows=None,
             iterations=iteration,
             ok=False,
-            error=agent_error or execution.error,
+            error=execution.error,
             history=history,
         )
 
